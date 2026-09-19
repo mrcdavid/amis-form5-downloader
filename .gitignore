@@ -1,0 +1,17 @@
+# Edge / browser profile
+edge-profile/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment variables / secrets
+.env
+
+# Downloaded Form 5 files
+output/
+downloads/
+
+# Temporary files
+*.tmp
+*_temporary.pdf
