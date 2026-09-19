@@ -135,8 +135,26 @@ async def main():
     async with async_playwright() as p:
 
         print("=" * 70)
-        print("AMIS FORM 5 DOWNLOADER")
+        print("███████╗ ██████╗ ██████╗ ███╗   ███╗")
+        print("██╔════╝██╔═══██╗██╔══██╗████╗ ████║")
+        print("█████╗  ██║   ██║██████╔╝██╔████╔██║")
+        print("██╔══╝  ██║   ██║██╔══██╗██║╚██╔╝██║")
+        print("██║     ╚██████╔╝██║  ██║██║ ╚═╝ ██║")
+        print("██║      ╚═════╝ ██║  ██║██║     ██║")
+        print("╚═╝              ╚═╝  ╚═╝╚═╝     ╚═╝")
+        print()
+        print("████████╗██╗  ██╗██╗   ██╗███╗   ██╗██████╗ ███████╗██████╗")
+        print("╚══██╔══╝██║  ██║██║   ██║████╗  ██║██╔══██╗██╔════╝██╔══██╗")
+        print("   ██║   ███████║██║   ██║██╔██╗ ██║██║  ██║█████╗  ██████╔╝")
+        print("   ██║   ██╔══██║██║   ██║██║╚██╗██║██║  ██║██╔══╝  ██╔══██╗")
+        print("   ██║   ██║  ██║╚██████╔╝██║ ╚████║██████╔╝███████╗██║  ██║")
+        print("   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚═════╝ ╚══════╝╚═╝  ╚═╝")
+        print()
+        print("[+] FORM THUNDER // AMIS DOWNLOADER")
+        print("[+] SYSTEM STATUS: ONLINE")
         print("=" * 70)
+
+
 
         # ----------------------------------------------------
         # Launch browser
@@ -145,17 +163,17 @@ async def main():
         #browser = await p.chromium.launch(
         #    headless=False
         #)
-        browser = await p.chromium.launch(
-            headless=False,
-            channel="msedge"
+        #browser = await p.chromium.launch(
+        #    headless=False,
+        #    channel="msedge"
+        #)
+        browser = await p.chromium.connect_over_cdp(
+            "http://127.0.0.1:9222"
         )
 
-        context = await browser.new_context(
-            accept_downloads=True
-        )
-
-        page = await context.new_page()
-
+        context = browser.contexts[0]
+        page = context.pages[0]
+        
         # ----------------------------------------------------
         # Open AMIS
         # ----------------------------------------------------
@@ -190,25 +208,25 @@ async def main():
         # ----------------------------------------------------
 
         view_buttons = page.get_by_text(
-            "View",
+            "Form 5",
             exact=True
         )
 
         count = await view_buttons.count()
 
         print(
-            f"\nFound {count} View buttons."
+            f"\nFound {count} Form 5 buttons."
         )
 
         if count == 0:
 
             print(
-                "\nNo View buttons were found."
+                "\nNo Form 5 buttons were found."
             )
 
             print(
                 "Inspect the page HTML and adjust the "
-                "View selector."
+                "Form 5 selector."
             )
 
             await browser.close()
@@ -231,14 +249,14 @@ async def main():
 
             # Re-query because the page may change
             view_buttons = page.get_by_text(
-                "View",
+                "Form 5",
                 exact=True
             )
 
             if index >= await view_buttons.count():
 
                 print(
-                    "No more View buttons."
+                    "No more Form 5 buttons."
                 )
 
                 break
@@ -309,20 +327,18 @@ async def main():
             # ------------------------------------------------
 
             print(
-                "\nClicking View..."
+                "\nClicking Form 5..."
             )
 
+            # ------------------------------------------------
+            # Detect whether Form 5 opens a new tab
+            # ------------------------------------------------
+            existing_pages = set(context.pages)
+
             try:
-
-                await button.click(
-                    timeout=10000
-                )
-
+                await button.click(timeout=10000)
             except Exception as e:
-
-                print(
-                    f"Could not click View: {e}"
-                )
+                print(f"Could not click Form 5: {e}")
 
                 page.remove_listener(
                     "response",
@@ -330,6 +346,11 @@ async def main():
                 )
 
                 continue
+
+            # ------------------------------------------------
+            # Give the browser time to open the PDF tab
+            # ------------------------------------------------
+            await page.wait_for_timeout(1000)
 
             # ------------------------------------------------
             # Wait for form5.php
@@ -415,6 +436,36 @@ async def main():
                 temporary_file
             )
 
+            def extract_degree(row_text: str) -> str | None:
+
+                if not row_text:
+                    return None
+
+                # Normalize the row
+                text = re.sub(r'\s+', ' ', row_text).strip()
+
+                # Common degree/program patterns
+                patterns = [
+                    r'\bBS[A-Z]{2,10}_[A-Z0-9]+\b',
+                    r'\bBS[A-Z]{2,10}\b',
+                    r'\bBA[A-Z]{2,10}_[A-Z0-9]+\b',
+                    r'\bBA[A-Z]{2,10}\b',
+                    r'\bB[A-Z]{2,10}_[A-Z0-9]+\b',
+                    r'\bB[A-Z]{2,10}\b',
+                    r'\bMS[A-Z]{2,10}_[A-Z0-9]+\b',
+                    r'\bMS[A-Z]{2,10}\b',
+                    r'\bMA[A-Z]{2,10}_[A-Z0-9]+\b',
+                    r'\bMA[A-Z]{2,10}\b',
+                ]
+
+                for pattern in patterns:
+                    match = re.search(pattern, text, re.IGNORECASE)
+
+                    if match:
+                        return clean_filename(match.group(0))
+
+                return None
+
             # ------------------------------------------------
             # If PDF extraction fails, attempt to obtain
             # name from the table row.
@@ -430,55 +481,62 @@ async def main():
                     "You can customize row parsing here."
                 )
 
-            # ------------------------------------------------
-            # Rename
-            # ------------------------------------------------
+            # ------------------------------------------------*
+            # Extract degree from AMIS row
+            # ------------------------------------------------*
+            degree = extract_degree(row_text)
 
+            print(
+                f"\nDegree detected: {degree}"
+                if degree
+                else "\nDegree could not be detected."
+            )
+
+            # ------------------------------------------------*
+            # Rename PDF
+            # ------------------------------------------------*
             if student_name:
+
+                if degree:
+                    filename = f"{degree}_{student_name}"
+                else:
+                    filename = student_name
 
                 final_file = unique_filename(
                     OUTPUT_FOLDER,
-                    student_name
+                    filename
                 )
 
-                temporary_file.rename(
-                    final_file
-                )
+                temporary_file.rename(final_file)
 
-                print(
-                    "\nSUCCESS!"
-                )
-
-                print(
-                    f"Student: {student_name}"
-                )
-
-                print(
-                    f"Saved: {final_file}"
-                )
+                print("\nSUCCESS!")
+                print(f"Degree: {degree or 'UNKNOWN'}")
+                print(f"Student: {student_name}")
+                print(f"Saved: {final_file}")
 
             else:
-
                 unknown_file = (
                     OUTPUT_FOLDER
                     / f"UNKNOWN_{index + 1}.pdf"
                 )
 
-                temporary_file.rename(
-                    unknown_file
-                )
+                temporary_file.rename(unknown_file)
 
-                print(
-                    "\nWARNING:"
-                )
+                print("\nWARNING:")
+                print("Could not determine student name.")
+                print(f"Saved as: {unknown_file}")
 
-                print(
-                    "Could not determine student name."
-                )
 
-                print(
-                    f"Saved as: {unknown_file}"
-                )
+            # ------------------------------------------------*
+            # Close PDF tab if one was opened
+            # ------------------------------------------------*
+            for opened_page in context.pages:
+                if opened_page not in existing_pages:
+                    try:
+                        print("\nClosing Form 5 PDF tab...")
+                        await opened_page.close()
+                    except Exception:
+                        pass
 
             # ------------------------------------------------
             # Wait before next student
@@ -507,7 +565,7 @@ async def main():
         )
 
         await browser.close()
-
+        #await context.close()
 
 # ============================================================
 # START
