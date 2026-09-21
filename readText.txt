@@ -1,5 +1,19 @@
-Run 
+Commands
 
+to kill edge
+taskkill /F /IM msedge.exe
+
+run to open edge debugging mode - laptop code
 "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --remote-debugging-port=9222 --user-data-dir="%USERPROFILE%\edge-amis"
 
-in your cmd to open browser in debugging mode
+run this to open edge debugging mode
+"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --remote-debugging-port=9222
+
+if it doesn't work, run this
+"C:\Program Files\Microsoft\Edge\Application\msedge.exe" --remote-debugging-port=9222
+
+Or, if your Edge is installed under your user account:
+"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe" --remote-debugging-port=9222
+
+to verify
+http://127.0.0.1:9222/json/version
