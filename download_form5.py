@@ -59,6 +59,8 @@ SCHOLARSHIP_TAGS = [
     ("FREETUITION", "RA 10931 - Free Tuition"),
     ("PD577", "PD 577"),
     ("PD1567", "PD 1567"),
+    ("PD33", "PD 33"),
+    ("PD60", "PD 60"),
     ("PD80", "PD 80"),
     ("STFAP", "STFAP"),
     ("SCHOLAR", "Scholar (unspecified)"),
