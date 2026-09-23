@@ -1,9 +1,11 @@
+import argparse
 import asyncio
+import io
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from playwright.async_api import async_playwright
 from pypdf import PdfReader
 import openpyxl
 from openpyxl.styles import Font, PatternFill
@@ -20,14 +22,13 @@ URL = (
     "?orderby=alast_name"
 )
 
+CDP_ENDPOINT = "http://127.0.0.1:9222"
+
 OUTPUT_FOLDER = Path("downloaded_form5")
 OUTPUT_FOLDER.mkdir(exist_ok=True)
 
 EXCEL_PATH = OUTPUT_FOLDER / "form5_tracking.xlsx"
 SHEET_NAME = "Form 5 Tracking"
-
-# Your current term
-TERM_ID = "1261"
 
 # How long to wait for the form5.php response before giving up (seconds)
 RESPONSE_TIMEOUT = 8.0
@@ -37,163 +38,182 @@ RESPONSE_TIMEOUT = 8.0
 INTER_STUDENT_DELAY = 0.15
 
 # ------------------------------------------------------------
-# Scholarship / privilege tags, and registration status tags.
+# Registration status = the watermark stamped across the PDF.
 #
-# Form 5 stamps some headers (e.g. "OFFICIALLY REGISTERED") using
-# individually-spaced letters -- "O F F I C I A L L Y  R E G I S T E R E D" --
-# which breaks normal regex matching. To handle this, we compare against
-# a "squeezed" version of the PDF text with ALL whitespace stripped out
-# and uppercased, so spacing style never matters. That means each tag
-# below is written as a plain no-space substring (not a regex).
+# The watermark is extracted as letter-spaced text, e.g.
+# "O F F I C I A L L Y  R E G I S T E R E D", and appears before the
+# "UP FORM 5." header. Keys below are written WITHOUT spaces because
+# they are compared against whitespace-stripped ("squeezed") text.
+# Checked top to bottom; first match wins.
+# ------------------------------------------------------------
+WATERMARK_TAGS = [
+    ("OFFICIALLYREGISTERED", "Officially Registered"),
+    ("BILLING", "Billing"),
+]
+DEFAULT_REGISTRATION_LABEL = "Unknown"
+
+# ------------------------------------------------------------
+# Scholarship / privilege = the value printed in the
+# "SCHOLARSHIP / PRIVILEGES" box (bottom-right of the form),
+# e.g. "RA 10931 FREE TUITION" or "PD80".
 #
-# Each entry is (no-space substring to look for, friendly label written
-# to Excel). Checked top to bottom; first match wins.
+# Only that box is searched -- NOT the whole PDF, because every
+# Form 5 contains the sentence "...to avail Free Tuition and Other
+# School Fees", which would otherwise tag everyone as RA 10931.
 #
-# !!! ADJUST THESE to match the exact wording your Form 5 uses !!!
-# The scholarship/privilege block sits bottom-right on the form --
-# paste that section's raw text (printed under "PDF TEXT:" when the
-# script runs) and I can tighten this list to your real codes.
+# Keys are no-space, uppercase. Longer codes must come before
+# shorter codes they contain (FDS before FD). If the box has a value
+# that matches none of these, the raw value is written instead.
 # ------------------------------------------------------------
 SCHOLARSHIP_TAGS = [
     ("RA10931", "RA 10931 - Free Tuition"),
     ("FREETUITION", "RA 10931 - Free Tuition"),
-    ("TFE", "TFE"),
-    ("FD", "FD"),
     ("FDS", "FDS"),
+    ("FD", "FD"),
+    ("TFE", "TFE"),
     ("PD33", "PD 33"),
     ("PD60", "PD 60"),
     ("PD80", "PD 80"),
-    ("SCHOLAR", "Scholar (unspecified)"),
 ]
-DEFAULT_SCHOLARSHIP_LABEL = "Without"
+DEFAULT_SCHOLARSHIP_LABEL = "NE"
 
-REGISTRATION_TAGS = [
-    ("NOTOFFICIALLYREGISTERED", "Not Registered"),
-    ("OFFICIALLYREGISTERED", "Officially Registered"),
-    ("FORBILLING", "For Billing"),
-    ("BILLINGSTATEMENT", "For Billing"),
-]
-DEFAULT_REGISTRATION_LABEL = "Unknown"
+
+# ============================================================
+# PDF PARSING
+# ============================================================
+
+NAME_RE = re.compile(r"\bNAME\s*:\s*(.+)", re.IGNORECASE)
+
+# Form 5 prints e.g. "STUDENT NO. 202310846" (no dash). Also accept
+# the dashed "2023-10846" style just in case.
+STUDENT_NO_RE = re.compile(r"STUDENT\s*NO\.?\s*:?\s*(\d{4}-?\d{5})", re.IGNORECASE)
+
+# "COLLEGE PROGRAM TERM & SY\nCEAT BSCE" -> program is the 2nd token
+PROGRAM_RE = re.compile(r"COLLEGE\s+PROGRAM\s+TERM\s*&\s*SY\s+(\S+)\s+(\S+)", re.IGNORECASE)
+
+SCHOLARSHIP_BLOCK_RE = re.compile(
+    r"SCHOLARSHIP\s*/\s*PRIVILEGES\s*(.*?)\s*(?:Change of Matriculation|Deposit Fee|Date Generated|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Fallback for the degree when the PDF layout is unexpected: look in
+# the student-list row text. Case-sensitive so surnames don't match.
+ROW_DEGREE_RE = re.compile(r"\b(?:BS|BA|MS|MA|PHD)[A-Z]{1,10}(?:_[A-Z0-9]+)?\b")
+
+
+@dataclass
+class Form5Info:
+    name: str | None
+    student_number: str | None
+    degree: str | None
+    registration_status: str
+    scholarship: str
 
 
 def squeeze(text: str) -> str:
-    """Strip ALL whitespace and uppercase -- makes matching immune to
-    letter-spaced headers like 'O F F I C I A L L Y  R E G I S T E R E D'."""
-    return re.sub(r'\s+', '', text or '').upper()
+    """Strip ALL whitespace and uppercase, so letter-spaced stamps match."""
+    return re.sub(r"\s+", "", text or "").upper()
 
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
 
 def clean_filename(name: str) -> str:
     """Make the student name safe for a Windows filename."""
-    name = re.sub(r'[<>:"/\\|?*]', '', name)
-    name = re.sub(r'\s+', ' ', name)
+    name = re.sub(r'[<>:"/\\|?*]', "", name)
+    name = re.sub(r"\s+", " ", name)
     return name.strip()
 
 
 def normalize_text(s: str) -> str:
     """Lowercase + collapse whitespace, for fuzzy matching."""
-    return re.sub(r'\s+', ' ', s or "").strip().lower()
+    return re.sub(r"\s+", " ", s or "").strip().lower()
 
 
-DEGREE_PATTERNS = [
-    r'\bBS[A-Z]{2,10}_[A-Z0-9]+\b',
-    r'\bBS[A-Z]{2,10}\b',
-    r'\bBA[A-Z]{2,10}_[A-Z0-9]+\b',
-    r'\bBA[A-Z]{2,10}\b',
-    r'\bB[A-Z]{2,10}_[A-Z0-9]+\b',
-    r'\bB[A-Z]{2,10}\b',
-    r'\bMS[A-Z]{2,10}_[A-Z0-9]+\b',
-    r'\bMS[A-Z]{2,10}\b',
-    r'\bMA[A-Z]{2,10}_[A-Z0-9]+\b',
-    r'\bMA[A-Z]{2,10}\b',
-]
-
-NAME_PATTERNS = [
-    r'Student Name\s*:\s*(.+)',
-    r'Name of Student\s*:\s*(.+)',
-    r'Name\s*:\s*(.+)',
-    r'Student\s*:\s*(.+)',
-]
-
-# UP student numbers are typically "YYYY-NNNNN" (e.g. 2021-01234).
-# !!! ADJUST if your student numbers look different !!!
-STUDENT_NO_PATTERNS = [
-    r'Student\s*No\.?\s*:?\s*(\d{4}-\d{4,6})',
-    r'Student\s*Number\s*:?\s*(\d{4}-\d{4,6})',
-    r'\b(\d{4}-\d{5})\b',
-]
-
-
-def extract_degree(row_text: str) -> str | None:
-    """Pull a degree/program code out of a table row's text."""
-    if not row_text:
-        return None
-
-    text = re.sub(r'\s+', ' ', row_text).strip()
-
-    for pattern in DEGREE_PATTERNS:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return clean_filename(match.group(0))
-
-    return None
-
-
-def get_pdf_text(pdf_path: Path) -> str:
-    """Extract all text from a PDF (used for name, student no, tags)."""
+def pdf_text(source) -> str:
+    """Extract all text from a PDF (a path or raw bytes)."""
+    if isinstance(source, (bytes, bytearray)):
+        source = io.BytesIO(source)
     try:
-        reader = PdfReader(str(pdf_path))
-        full_text = "\n".join(page.extract_text() or "" for page in reader.pages)
-
-        print("\nPDF TEXT:")
-        print("-" * 60)
-        print(full_text[:3000])
-        print("-" * 60)
-
-        return full_text
-
+        reader = PdfReader(source)
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
     except Exception as e:
         print(f"ERROR extracting PDF text: {e}")
         return ""
 
 
-def extract_student_name(full_text: str) -> str | None:
-    """Extract the student's name from the PDF's text."""
-    for pattern in NAME_PATTERNS:
-        match = re.search(pattern, full_text, re.IGNORECASE)
-        if match:
-            name = match.group(1).split("\n")[0]
-            name = clean_filename(name)
-            if name:
-                return name
-    return None
+def extract_student_name(text: str) -> str | None:
+    match = NAME_RE.search(text)
+    if not match:
+        return None
+    return clean_filename(match.group(1).split("\n")[0]) or None
 
 
-def extract_student_number(full_text: str) -> str | None:
-    """Extract the student number from the PDF's text."""
-    for pattern in STUDENT_NO_PATTERNS:
-        match = re.search(pattern, full_text, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-    return None
+def extract_student_number(text: str) -> str | None:
+    match = STUDENT_NO_RE.search(text)
+    return match.group(1) if match else None
 
 
-def extract_tagged_field(full_text: str, tag_list, default_label: str) -> str:
-    """Generic first-match tag lookup (used for registration + scholarship).
-    Matches against whitespace-stripped text so letter-spaced stamps like
-    'O F F I C I A L L Y  R E G I S T E R E D' still match."""
-    squeezed = squeeze(full_text)
-    for substring, label in tag_list:
-        if substring in squeezed:
+def extract_degree(text: str, row_text: str = "") -> str | None:
+    match = PROGRAM_RE.search(text)
+    if match:
+        return clean_filename(match.group(2))
+    match = ROW_DEGREE_RE.search(row_text or "")
+    return clean_filename(match.group(0)) if match else None
+
+
+def extract_registration_status(text: str) -> str:
+    """Read the watermark (OFFICIALLY REGISTERED / BILLING)."""
+    # Normally the watermark is everything before the form header.
+    header_pos = text.upper().find("UP FORM 5")
+    if header_pos > 0:
+        region = squeeze(text[:header_pos])
+        for key, label in WATERMARK_TAGS:
+            if key in region:
+                return label
+
+    # Fallback: find the letter-spaced stamp anywhere. Requiring
+    # whitespace between every letter means ordinary words never match.
+    for key, label in WATERMARK_TAGS:
+        if re.search(r"\s+".join(key), text, re.IGNORECASE):
             return label
-    return default_label
 
+    return DEFAULT_REGISTRATION_LABEL
+
+
+def extract_scholarship(text: str) -> str:
+    """Read the value in the SCHOLARSHIP / PRIVILEGES box."""
+    match = SCHOLARSHIP_BLOCK_RE.search(text)
+    if not match:
+        return DEFAULT_SCHOLARSHIP_LABEL
+
+    raw = re.sub(r"\s+", " ", match.group(1)).strip()
+    if not raw:
+        return DEFAULT_SCHOLARSHIP_LABEL
+
+    squeezed = squeeze(raw)
+    for key, label in SCHOLARSHIP_TAGS:
+        if key in squeezed:
+            return label
+
+    # Unknown code: keep the raw value (if it looks like a short code)
+    # so it can be added to SCHOLARSHIP_TAGS later.
+    return raw if len(raw) <= 40 else DEFAULT_SCHOLARSHIP_LABEL
+
+
+def parse_form5(text: str, row_text: str = "") -> Form5Info:
+    return Form5Info(
+        name=extract_student_name(text),
+        student_number=extract_student_number(text),
+        degree=extract_degree(text, row_text),
+        registration_status=extract_registration_status(text),
+        scholarship=extract_scholarship(text),
+    )
+
+
+# ============================================================
+# FILES / DEDUP
+# ============================================================
 
 def unique_filename(folder: Path, name: str) -> Path:
-    """Prevent overwriting existing files (within-run collisions only)."""
+    """Prevent overwriting existing files."""
     path = folder / f"{name}.pdf"
     counter = 2
     while path.exists():
@@ -203,7 +223,7 @@ def unique_filename(folder: Path, name: str) -> Path:
 
 
 def make_key(degree: str | None, student_name: str) -> str:
-    """Canonical dedup key for a student's Form 5."""
+    """Canonical dedup key for a student's Form 5 (matches the filename)."""
     base = f"{degree}_{student_name}" if degree else student_name
     return normalize_text(base)
 
@@ -214,23 +234,20 @@ def build_existing_index(folder: Path) -> dict:
       (a) skip re-downloading a student we already have (post-check), and
       (b) recognize a student's row BEFORE clicking, by checking whether
           their name (pulled from an existing filename) shows up in the
-          row text (pre-check) -- this lets us skip the click entirely
-          on repeat runs.
+          row text (pre-check).
     """
     keys = set()
     names = set()
 
     for f in folder.glob("*.pdf"):
-        if f.name.startswith("_temporary_") or f.name.startswith("UNKNOWN_"):
+        if f.name.startswith(("_temporary_", "UNKNOWN_")):
             continue
 
-        stem = f.stem
-        stem = re.sub(r'\s*\(\d+\)$', '', stem)  # strip " (2)" style suffix
-        keys.add(stem.lower())
+        stem = re.sub(r"\s*\(\d+\)$", "", f.stem)  # strip " (2)" style suffix
+        keys.add(normalize_text(stem))
 
-        parts = stem.split('_', 1)
-        name_part = parts[1] if len(parts) == 2 else stem
-        norm = normalize_text(name_part)
+        parts = stem.split("_", 1)
+        norm = normalize_text(parts[1] if len(parts) == 2 else stem)
         if norm:
             names.add(norm)
 
@@ -251,28 +268,34 @@ EXCEL_HEADERS = [
     "PDF Filename",
     "Notes",
 ]
+EXCEL_WIDTHS = [16, 16, 30, 18, 22, 24, 34, 30]
 
 
-def init_excel(path: Path):
-    """Open the tracking workbook, creating it with a header row if new."""
-    if path.exists():
-        wb = openpyxl.load_workbook(path)
-        if SHEET_NAME not in wb.sheetnames:
-            ws = wb.create_sheet(SHEET_NAME)
-            _write_excel_header(ws)
-        else:
-            ws = wb[SHEET_NAME]
-        return wb, ws
+def init_excel(path: Path, fresh: bool = False):
+    """Open the tracking workbook, creating it (or just the sheet) if needed.
+    fresh=True replaces the tracking sheet with an empty one."""
+    wb = openpyxl.load_workbook(path) if path.exists() else openpyxl.Workbook()
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = SHEET_NAME
-    _write_excel_header(ws)
+    if not path.exists():
+        wb.active.title = SHEET_NAME
+        _write_excel_header(wb.active)
+        return wb, wb.active
+
+    if fresh and SHEET_NAME in wb.sheetnames:
+        position = wb.sheetnames.index(SHEET_NAME)
+        wb.remove(wb[SHEET_NAME])
+        ws = wb.create_sheet(SHEET_NAME, position)
+        _write_excel_header(ws)
+    elif SHEET_NAME not in wb.sheetnames:
+        ws = wb.create_sheet(SHEET_NAME)
+        _write_excel_header(ws)
+    else:
+        ws = wb[SHEET_NAME]
     return wb, ws
 
 
 def _write_excel_header(ws):
-    header_fill = PatternFill(start_color="8D1436", end_color="1F4E78", fill_type="solid")
+    header_fill = PatternFill(start_color="8D1436", end_color="8D1436", fill_type="solid")
     header_font = Font(name="Arial", bold=True, color="FFFFFF")
 
     for col_idx, header in enumerate(EXCEL_HEADERS, start=1):
@@ -283,150 +306,184 @@ def _write_excel_header(ws):
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:{get_column_letter(len(EXCEL_HEADERS))}1"
 
-    widths = [16, 16, 30, 18, 20, 24, 34, 30]
-    for col_idx, width in enumerate(widths, start=1):
+    for col_idx, width in enumerate(EXCEL_WIDTHS, start=1):
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
 
-def append_excel_row(ws, row_values: list):
+def append_excel_row(ws, info: Form5Info, filename: str, notes: str = "", processed: datetime | None = None):
     row_idx = ws.max_row + 1
-    for col_idx, value in enumerate(row_values, start=1):
+    values = [
+        (processed or datetime.now()).strftime("%Y-%m-%d %H:%M"),
+        info.student_number or "",
+        info.name or "UNKNOWN",
+        info.degree or "",
+        info.registration_status,
+        info.scholarship,
+        filename,
+        notes,
+    ]
+    for col_idx, value in enumerate(values, start=1):
         cell = ws.cell(row=row_idx, column=col_idx, value=value)
         cell.font = Font(name="Arial")
+    # Keep student numbers as text so Excel doesn't reformat them
+    ws.cell(row=row_idx, column=2).number_format = "@"
+
+
+def excel_key(student_number: str | None, student_name: str | None) -> str:
+    return normalize_text(student_number) if student_number else normalize_text(student_name)
 
 
 def build_excel_existing_keys(ws) -> set:
     """Avoid duplicate Excel rows across runs (by student number, else name)."""
     keys = set()
     for row in ws.iter_rows(min_row=2, values_only=True):
-        if not row:
-            continue
-        student_no, student_name = row[1], row[2]
-        key = normalize_text(student_no) if student_no else normalize_text(student_name)
-        if key:
-            keys.add(key)
+        if row:
+            key = excel_key(row[1], row[2])
+            if key:
+                keys.add(key)
     return keys
 
 
-async def close_extra_tabs(context, main_page):
-    """
-    Close all tabs except the main AMIS page.
-    Re-check several times because AMIS may open PDF tabs asynchronously.
-    """
-    for attempt in range(5):
-        await asyncio.sleep(0.3)
-
-        pages = list(context.pages)
-
-        extra_pages = [
-            p for p in pages
-            if p != main_page
-        ]
-
-        if not extra_pages:
-            print("No extra tabs found.")
+def save_excel(wb, path: Path):
+    """Save, and if Excel has the file open/locked, ask the user to close it."""
+    while True:
+        try:
+            wb.save(path)
             return
+        except PermissionError:
+            input(f"\nCannot save '{path}' - it is probably open in Excel. "
+                  "Close it, then press ENTER to retry...")
 
-        print(f"Found {len(extra_pages)} extra tab(s). Closing...")
 
+def rebuild_excel():
+    """Re-parse every PDF in OUTPUT_FOLDER and rewrite the tracking sheet.
+    Notes typed into the old sheet are kept (matched by PDF filename)."""
+    old_notes = {}
+    if EXCEL_PATH.exists():
+        wb = openpyxl.load_workbook(EXCEL_PATH)
+        if SHEET_NAME in wb.sheetnames:
+            for row in wb[SHEET_NAME].iter_rows(min_row=2, values_only=True):
+                if row and len(row) >= 8 and row[6] and row[7]:
+                    old_notes[row[6]] = row[7]
+
+    wb, ws = init_excel(EXCEL_PATH, fresh=True)
+    pdfs = sorted(f for f in OUTPUT_FOLDER.glob("*.pdf") if not f.name.startswith("_temporary_"))
+
+    for f in pdfs:
+        info = parse_form5(pdf_text(f))
+        notes = old_notes.get(f.name, "")
+        if not info.name and not notes:
+            notes = "Name could not be parsed from PDF - please check manually"
+        append_excel_row(ws, info, f.name, notes, datetime.fromtimestamp(f.stat().st_mtime))
+        print(f"{info.student_number or '?':>10}  {info.registration_status:<22}  "
+              f"{info.scholarship:<24}  {f.name}")
+
+    save_excel(wb, EXCEL_PATH)
+    print(f"\nRebuilt '{EXCEL_PATH}' from {len(pdfs)} PDF(s).")
+
+
+# ============================================================
+# BROWSER HELPERS
+# ============================================================
+
+async def close_extra_tabs(context, main_page):
+    """Close all tabs except the main AMIS page. Re-check a few times
+    because AMIS may open PDF tabs asynchronously."""
+    for _ in range(5):
+        await asyncio.sleep(0.3)
+        extra_pages = [p for p in context.pages if p != main_page]
+        if not extra_pages:
+            return
         for extra_page in extra_pages:
             try:
-                print(f"  Closing: {extra_page.url}")
                 await extra_page.close()
             except Exception as e:
                 print(f"  Could not close tab: {e}")
 
-    print("Finished checking extra tabs.")
+
+async def click_and_capture_form5(page, context, button):
+    """Click a Form 5 button and return the form5.php response (or None).
+    Works whether AMIS loads the PDF in the same tab or a new one."""
+    form5_response = None
+    form5_event = asyncio.Event()
+
+    def handle_response(response):
+        nonlocal form5_response
+        if "form5.php" in response.url and not form5_event.is_set():
+            form5_response = response
+            form5_event.set()
+
+    def handle_new_page(new_page):
+        new_page.on("response", handle_response)
+
+    page.on("response", handle_response)
+    context.on("page", handle_new_page)
+    try:
+        await button.click(timeout=10000)
+        await asyncio.wait_for(form5_event.wait(), timeout=RESPONSE_TIMEOUT)
+    except asyncio.TimeoutError:
+        pass
+    except Exception as e:
+        print(f"Could not click Form 5: {e}")
+    finally:
+        page.remove_listener("response", handle_response)
+        context.remove_listener("page", handle_new_page)
+
+    return form5_response
+
 
 # ============================================================
 # MAIN
 # ============================================================
 
-async def main():
+async def download_all(debug: bool = False):
+    from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
 
         print("=" * 70)
-        print("[+] FORM THUNDER // AMIS DOWNLOADER (optimized)")
-        print("[+] SYSTEM STATUS: ONLINE")
+        print("[+] FORM THUNDER // AMIS DOWNLOADER")
         print("=" * 70)
 
-        # ----------------------------------------------------
-        # Connect to your already-open, already-logged-in browser
-        # ----------------------------------------------------
-
-        browser = await p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+        # Connect to the already-open, already-logged-in Edge (see CLAUDE.md)
+        browser = await p.chromium.connect_over_cdp(CDP_ENDPOINT)
         context = browser.contexts[0]
         page = context.pages[0]
 
-        # ----------------------------------------------------
-        # Open AMIS
-        # ----------------------------------------------------
-
         print("\nOpening AMIS...")
         await page.goto(URL, wait_until="domcontentloaded")
-        print("AMIS page opened.")
-
         print("\nIf AMIS requires login, log in now.")
         input("Press ENTER after the student list is visible...")
 
-        # ----------------------------------------------------
-        # Build the duplicate index + open the tracking workbook
-        # ----------------------------------------------------
-
         existing_index = build_existing_index(OUTPUT_FOLDER)
-        print(
-            f"\nFound {len(existing_index['keys'])} existing Form 5 PDF(s) "
-            f"already in '{OUTPUT_FOLDER}'. These will be skipped."
-        )
+        print(f"\nFound {len(existing_index['keys'])} existing Form 5 PDF(s) "
+              f"in '{OUTPUT_FOLDER}'. These will be skipped.")
 
         excel_wb, excel_ws = init_excel(EXCEL_PATH)
         excel_existing_keys = build_excel_existing_keys(excel_ws)
         print(f"Tracking sheet: {EXCEL_PATH} ({len(excel_existing_keys)} row(s) already logged)")
 
-        # ----------------------------------------------------
-        # Find Form 5 buttons
-        # ----------------------------------------------------
-
         view_buttons = page.get_by_text("Form 5", exact=True)
         count = await view_buttons.count()
-
         print(f"\nFound {count} Form 5 buttons.")
 
         if count == 0:
-            print("\nNo Form 5 buttons were found.")
-            print("Inspect the page HTML and adjust the Form 5 selector.")
-            excel_wb.save(EXCEL_PATH)
+            print("No Form 5 buttons were found. Inspect the page HTML and adjust the selector.")
             await browser.close()
             return
 
-        skipped_early = 0
-        skipped_duplicate = 0
-        downloaded = 0
-        failed = 0
-
-        # ----------------------------------------------------
-        # Process each student
-        # ----------------------------------------------------
+        skipped_early = skipped_duplicate = downloaded = failed = 0
 
         for index in range(count):
-
-            print("\n" + "=" * 70)
-            print(f"PROCESSING STUDENT {index + 1} / {count}")
-            print("=" * 70)
+            print(f"\n--- STUDENT {index + 1} / {count} ---")
 
             view_buttons = page.get_by_text("Form 5", exact=True)
-            current_count = await view_buttons.count()
-            if index >= current_count:
+            if index >= await view_buttons.count():
                 print("No more Form 5 buttons.")
                 break
 
             button = view_buttons.nth(index)
             await button.scroll_into_view_if_needed()
-
-            # ------------------------------------------------
-            # Grab the row text (used for dedup and degree)
-            # ------------------------------------------------
 
             try:
                 row = button.locator("xpath=ancestor::tr")
@@ -434,196 +491,70 @@ async def main():
             except Exception:
                 row_text = ""
 
-            # ------------------------------------------------
-            # PRE-CLICK DUPLICATE CHECK
-            # ------------------------------------------------
-
+            # Pre-click duplicate check: skip without opening the PDF
             row_norm = normalize_text(row_text)
-            matched_existing_name = next(
-                (nm for nm in existing_index["names"] if nm and nm in row_norm),
-                None,
-            )
-
-            if matched_existing_name:
-                print(f"\nSKIP (already downloaded): row matches '{matched_existing_name}'")
+            matched = next((nm for nm in existing_index["names"] if nm in row_norm), None)
+            if matched:
+                print(f"SKIP (already downloaded): {matched}")
                 skipped_early += 1
                 continue
 
-            # ------------------------------------------------
-            # Intercept the form5 response (event-based, not polling)
-            # Also watch for the case where Form 5 opens in a new tab.
-            # ------------------------------------------------
+            form5_response = await click_and_capture_form5(page, context, button)
 
-            form5_response = None
-            form5_event = asyncio.Event()
+            pdf_bytes = b""
+            if form5_response:
+                try:
+                    pdf_bytes = await form5_response.body()
+                except Exception as e:
+                    print(f"Could not read PDF: {e}")
 
-            def handle_response(response):
-                nonlocal form5_response
-                if "form5.php" in response.url and not form5_event.is_set():
-                    form5_response = response
-                    form5_event.set()
-                    print(f"\nFORM 5 DETECTED:\n{response.url}")
-
-            def handle_new_page(new_page):
-                new_page.on("response", handle_response)
-
-            page.on("response", handle_response)
-            context.on("page", handle_new_page)
-
-            existing_pages = list(context.pages)
-
-            print("\nClicking Form 5...")
-            try:
-                await button.click(timeout=10000)
-            except Exception as e:
-                print(f"Could not click Form 5: {e}")
-                page.remove_listener("response", handle_response)
-                context.remove_listener("page", handle_new_page)
+            if not pdf_bytes.startswith(b"%PDF"):
+                print("WARNING: form5.php was not detected or did not return a PDF.")
                 failed += 1
+                await close_extra_tabs(context, page)
                 continue
 
-            try:
-                await asyncio.wait_for(form5_event.wait(), timeout=RESPONSE_TIMEOUT)
-            except asyncio.TimeoutError:
-                pass
+            text = pdf_text(pdf_bytes)
+            if debug:
+                print("\nPDF TEXT:\n" + "-" * 60 + f"\n{text[:3000]}\n" + "-" * 60)
 
-            page.remove_listener("response", handle_response)
-            context.remove_listener("page", handle_new_page)
+            info = parse_form5(text, row_text)
+            print(f"Student No: {info.student_number or 'UNKNOWN'} | Degree: {info.degree or 'UNKNOWN'} | "
+                  f"Status: {info.registration_status} | Scholarship: {info.scholarship}")
 
-            if not form5_response:
-                print("\nWARNING: form5.php was not detected.")
+            if not info.name:
+                unknown_file = unique_filename(OUTPUT_FOLDER, f"UNKNOWN_{index + 1}")
+                unknown_file.write_bytes(pdf_bytes)
+                print(f"WARNING: Could not determine student name. Saved as: {unknown_file}")
                 failed += 1
-                for opened_page in context.pages:
-                    if p != opened_page:
-                        try:
-                            await p.close()
-                        except Exception:
-                            pass
-                continue
+                append_excel_row(excel_ws, info, unknown_file.name,
+                                 "Name could not be parsed from PDF - please check manually")
+                save_excel(excel_wb, EXCEL_PATH)
 
-            # ------------------------------------------------
-            # Get PDF bytes
-            # ------------------------------------------------
-
-            try:
-                pdf_bytes = await form5_response.body()
-            except Exception as e:
-                print(f"Could not read PDF: {e}")
-                failed += 1
-                continue
-
-            temporary_file = OUTPUT_FOLDER / f"_temporary_{index + 1}.pdf"
-            temporary_file.write_bytes(pdf_bytes)
-
-            # ------------------------------------------------
-            # Extract everything from the PDF text in one pass
-            # ------------------------------------------------
-
-            full_text = get_pdf_text(temporary_file)
-            student_name = extract_student_name(full_text)
-            degree = extract_degree(row_text)
-            student_number = extract_student_number(full_text)
-            registration_status = extract_tagged_field(
-                full_text, REGISTRATION_TAGS, DEFAULT_REGISTRATION_LABEL
-            )
-            scholarship = extract_tagged_field(
-                full_text, SCHOLARSHIP_TAGS, DEFAULT_SCHOLARSHIP_LABEL
-            )
-
-            print(f"Degree detected: {degree}" if degree else "Degree could not be detected.")
-            print(f"Student No: {student_number or 'UNKNOWN'}")
-            print(f"Registration status: {registration_status}")
-            print(f"Scholarship privilege: {scholarship}")
-
-            if not student_name:
-                unknown_file = OUTPUT_FOLDER / f"UNKNOWN_{index + 1}.pdf"
-                temporary_file.rename(unknown_file)
-                print("\nWARNING: Could not determine student name.")
-                print(f"Saved as: {unknown_file}")
-                failed += 1
-
-                append_excel_row(excel_ws, [
-                    datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    student_number or "",
-                    "UNKNOWN",
-                    degree or "",
-                    registration_status,
-                    scholarship,
-                    unknown_file.name,
-                    "Name could not be parsed from PDF - please check manually",
-                ])
-                excel_wb.save(EXCEL_PATH)
+            elif make_key(info.degree, info.name) in existing_index["keys"]:
+                print(f"SKIP (duplicate found after download): {info.name}")
+                skipped_duplicate += 1
 
             else:
-                key = make_key(degree, student_name)
+                filename = f"{info.degree}_{info.name}" if info.degree else info.name
+                final_file = unique_filename(OUTPUT_FOLDER, filename)
+                final_file.write_bytes(pdf_bytes)
 
-                if key in existing_index["keys"]:
-                    temporary_file.unlink(missing_ok=True)
-                    print(f"\nSKIP (duplicate found after download): {student_name}")
-                    skipped_duplicate += 1
+                existing_index["keys"].add(make_key(info.degree, info.name))
+                existing_index["names"].add(normalize_text(info.name))
+                downloaded += 1
+                print(f"SAVED: {final_file.name}")
 
-                else:
-                    filename = f"{degree}_{student_name}" if degree else student_name
-                    final_file = unique_filename(OUTPUT_FOLDER, filename)
-                    temporary_file.rename(final_file)
-
-                    existing_index["keys"].add(key)
-                    existing_index["names"].add(normalize_text(student_name))
-
-                    downloaded += 1
-                    print("\nSUCCESS!")
-                    print(f"Degree: {degree or 'UNKNOWN'}")
-                    print(f"Student: {student_name}")
-                    print(f"Saved: {final_file}")
-
-                    excel_key = normalize_text(student_number) if student_number else normalize_text(student_name)
-                    if excel_key not in excel_existing_keys:
-                        append_excel_row(excel_ws, [
-                            datetime.now().strftime("%Y-%m-%d %H:%M"),
-                            student_number or "",
-                            student_name,
-                            degree or "",
-                            registration_status,
-                            scholarship,
-                            final_file.name,
-                            "",
-                        ])
-                        excel_wb.save(EXCEL_PATH)
-                        excel_existing_keys.add(excel_key)
-
-            # ------------------------------------------------
-            # Close any PDF tab that Form 5 opened
-            # ------------------------------------------------
-
-            # print("\nChecking for extra PDF tabs...")
-
-            # for opened_page in list(context.pages):
-            #     # Never close our main AMIS page
-            #     if opened_page == page:
-            #         continue
-
-            #     try:
-            #         print(f"Closing extra tab: {opened_page.url}")
-            #         await opened_page.close()
-            #     except Exception as e:
-            #         print(f"Could not close tab: {e}")
-
-            # await page.wait_for_timeout(
-            #     int(INTER_STUDENT_DELAY * 1000)
-            # )
-
-            # ------------------------------------------------
-            # Close any PDF tabs that Form 5 opened
-            # ------------------------------------------------
+                key = excel_key(info.student_number, info.name)
+                if key not in excel_existing_keys:
+                    append_excel_row(excel_ws, info, final_file.name)
+                    save_excel(excel_wb, EXCEL_PATH)
+                    excel_existing_keys.add(key)
 
             await close_extra_tabs(context, page)
+            await page.wait_for_timeout(int(INTER_STUDENT_DELAY * 1000))
 
-            await page.wait_for_timeout(
-                int(INTER_STUDENT_DELAY * 1000)
-            )
-
-        excel_wb.save(EXCEL_PATH)
-        
+        save_excel(excel_wb, EXCEL_PATH)
 
         print("\n" + "=" * 70)
         print("FINISHED")
@@ -639,9 +570,19 @@ async def main():
         await browser.close()
 
 
-# ============================================================
-# START
-# ============================================================
+def main():
+    parser = argparse.ArgumentParser(description="Download UPLB AMIS Form 5 PDFs and log them to Excel.")
+    parser.add_argument("--rebuild-excel", action="store_true",
+                        help="Re-parse the PDFs already in the output folder and rewrite the tracking sheet "
+                             "(no browser needed).")
+    parser.add_argument("--debug", action="store_true", help="Print the extracted PDF text for each student.")
+    args = parser.parse_args()
+
+    if args.rebuild_excel:
+        rebuild_excel()
+    else:
+        asyncio.run(download_all(debug=args.debug))
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
