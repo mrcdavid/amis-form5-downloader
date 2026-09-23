@@ -8,7 +8,8 @@ __pycache__/
 # Environment variables / secrets
 .env
 
-# Downloaded Form 5 files
+# Downloaded Form 5 files (student personal data)
+downloaded_form5/
 output/
 downloads/
 
