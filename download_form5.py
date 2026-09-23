@@ -57,12 +57,12 @@ INTER_STUDENT_DELAY = 0.15
 SCHOLARSHIP_TAGS = [
     ("RA10931", "RA 10931 - Free Tuition"),
     ("FREETUITION", "RA 10931 - Free Tuition"),
-    ("PD577", "PD 577"),
-    ("PD1567", "PD 1567"),
+    ("TFE", "TFE"),
+    ("FD", "FD"),
+    ("FDS", "FDS"),
     ("PD33", "PD 33"),
     ("PD60", "PD 60"),
     ("PD80", "PD 80"),
-    ("STFAP", "STFAP"),
     ("SCHOLAR", "Scholar (unspecified)"),
 ]
 DEFAULT_SCHOLARSHIP_LABEL = "Without"
