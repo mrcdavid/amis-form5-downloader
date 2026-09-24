@@ -16,3 +16,4 @@ downloads/
 # Temporary files
 *.tmp
 *_temporary.pdf
+.pytest_cache/

@@ -1,6 +1,24 @@
 # CLAUDE.md
 
-Single-script tool (`download_form5.py`) that bulk-downloads UPLB AMIS **Form 5** (Certificate of Registration) PDFs from the enrolled-student list and logs each one to an Excel tracking sheet.
+Tool that bulk-downloads UPLB AMIS **Form 5** (Certificate of Registration) PDFs from the enrolled-student list and logs each one to an Excel tracking sheet. The code lives in the `form5/` package; `download_form5.py` is a thin entry point.
+
+## Layout
+
+| Module | Responsibility |
+|---|---|
+| `form5/config.py` | All settings: URL, CDP endpoint, paths, timeouts, tag lists, Excel columns |
+| `form5/models.py` | `Form5Info` dataclass |
+| `form5/text_utils.py` | `squeeze`, `clean_filename`, `normalize_text` |
+| `form5/parsing.py` | Regexes, `pdf_text`, `extract_*`, `parse_form5` (pure: no browser, no Excel) |
+| `form5/storage.py` | Output filenames and dedup index (`unique_filename`, `make_key`, `build_existing_index`) |
+| `form5/excel.py` | Tracking sheet read/write, `save_excel` |
+| `form5/rebuild.py` | `--rebuild-excel` |
+| `form5/browser.py` | Playwright helpers (click Form 5, capture `form5.php`, close tabs) |
+| `form5/downloader.py` | Main download loop (`download_all`) |
+| `form5/cli.py` | Argument parsing, `main()` |
+| `tests/` | pytest tests for the parsers, using synthetic text only |
+
+Dependencies go one way: config/models/text_utils → parsing/storage/excel → rebuild/browser → downloader → cli. Playwright is imported inside `download_all` only, so `--rebuild-excel` doesn't need it.
 
 ## How it works
 
@@ -13,7 +31,7 @@ Single-script tool (`download_form5.py`) that bulk-downloads UPLB AMIS **Form 5*
 ## Setup (Windows)
 
 ```
-pip install playwright pypdf openpyxl
+pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
@@ -31,7 +49,11 @@ If Edge is somewhere else, try `C:\Program Files\Microsoft\Edge\Application\msed
 python download_form5.py                  # download new Form 5s + log to Excel
 python download_form5.py --debug          # also print each PDF's extracted text
 python download_form5.py --rebuild-excel  # re-parse existing PDFs and rewrite the sheet (no browser)
+python -m form5 ...                       # same as download_form5.py
+python -m pytest                          # run parser tests (pip install pytest)
 ```
+
+Run these from the repo root, because `downloaded_form5/` is resolved relative to the current directory.
 
 Use `--rebuild-excel` after changing any parsing rule, because PDFs that are already downloaded are skipped and their rows will not update on their own. Notes typed into the sheet are kept (matched by PDF filename). Close the workbook in Excel first; if it's open, the script waits and asks you to close it.
 
@@ -55,10 +77,11 @@ Gotchas:
 
 ## Conventions
 
-- Configuration lives in the constants at the top of `download_form5.py` (URL, timeouts, tag lists). Tune those instead of hardcoding values inside functions.
+- Configuration lives in `form5/config.py` (URL, timeouts, tag lists). Tune those instead of hardcoding values inside functions.
 - Parsing functions are pure (text in, value out), so you can test them without a browser:
   ```
-  python -c "import download_form5 as d; print(d.parse_form5(d.pdf_text('downloaded_form5/<file>.pdf')))"
+  python -c "from form5.parsing import parse_form5, pdf_text; print(parse_form5(pdf_text('downloaded_form5/<file>.pdf')))"
   ```
+  (`import download_form5 as d; d.parse_form5(...)` still works too.) When you change a parsing rule, add a case to `tests/test_parsing.py`, using fake names only.
 - The filename format `<DEGREE>_<NAME>.pdf` is also the dedup key. Changing it causes existing PDFs to be downloaded again.
 - `downloaded_form5/` and the Edge profiles contain student personal data and are git-ignored. Never commit them.
